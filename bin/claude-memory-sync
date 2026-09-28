@@ -1,0 +1,760 @@
+#!/usr/bin/env bash
+#
+# claude-memory-sync: keep Claude Code's auto memory in sync across machines
+# through a private git repository.
+#
+# How it works:
+#   * Each linked project's auto memory lives in the sync repo at
+#     ~/.claude-memory/projects/<name>/, wired up through the project's
+#     .claude/settings.local.json ("autoMemoryDirectory").
+#   * Claude Code hooks pull on session start and push after each turn.
+#   * MEMORY.md merges by union; any other file edited on two machines keeps
+#     both versions, so a sync never blocks and never loses a memory.
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+SYNC_DIR="${CLAUDE_MEMORY_SYNC_DIR:-$HOME/.claude-memory}"
+SYNC_DIR="${SYNC_DIR%/}"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+USER_SETTINGS="$CLAUDE_DIR/settings.json"
+
+LOCK_DIR="$SYNC_DIR/.git/claude-memory-sync.lock"
+LOG_FILE="$SYNC_DIR/.git/claude-memory-sync.log"
+LAST_SYNC_FILE="$SYNC_DIR/.git/claude-memory-sync.last"
+
+# Matches the hook commands this tool installs, quoted path or not.
+HOOK_RE='claude-memory-sync"? hook (session-start|stop|session-end)'
+
+MIGRATED=0
+CONFLICTS=0
+
+# --- helpers ----------------------------------------------------------------
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'claude-memory-sync: %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  case "$1" in
+    jq) die "jq is required. Install it with 'brew install jq' (macOS) or 'sudo apt install jq' (Debian/Ubuntu)." ;;
+    *)  die "$1 is required but not installed." ;;
+  esac
+}
+
+g() { git -C "$SYNC_DIR" "$@"; }
+
+# Network git calls give up instead of hanging on a dead connection.
+gnet() { g -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 "$@"; }
+
+log() {
+  [ -d "$SYNC_DIR/.git" ] || return 0
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(host_name)" "$*" >> "$LOG_FILE"
+}
+
+host_name() {
+  local h="${CLAUDE_MEMORY_SYNC_HOST:-}"
+  [ -n "$h" ] || h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo machine)
+  printf '%s' "$h" | tr -c 'A-Za-z0-9-' '-'
+}
+
+is_initialized() { [ -d "$SYNC_DIR/.git" ]; }
+require_init() { is_initialized || die "not set up yet. Run: claude-memory-sync init <git-url>"; }
+
+expand_tilde() {
+  case "$1" in
+    "~")   printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+tildify() {
+  case "$1" in
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *)         printf '%s' "$1" ;;
+  esac
+}
+
+self_path() {
+  local src="${BASH_SOURCE[0]}"
+  printf '%s/%s' "$(cd "$(dirname "$src")" && pwd -P)" "$(basename "$src")"
+}
+
+# Rewrite a JSON file through a jq filter. Writes in place so a symlinked
+# settings file (dotfiles setups) stays a symlink.
+json_edit() {
+  local file="$1" tmp
+  shift
+  mkdir -p "$(dirname "$file")"
+  [ -s "$file" ] || printf '{}\n' > "$file"
+  jq empty "$file" >/dev/null 2>&1 || die "$file is not valid JSON. Fix it and run the command again."
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-memory-sync.XXXXXX")
+  if jq "$@" "$file" > "$tmp"; then
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    die "could not update $file"
+  fi
+}
+
+json_get() {
+  [ -f "$1" ] || return 0
+  jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null || true
+}
+
+# --- projects ---------------------------------------------------------------
+
+# The folder holding the project's .claude/settings.local.json: the git top
+# level, or the folder itself outside git.
+project_root() {
+  local dir="${1:-$PWD}" top
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$top" ]; then printf '%s' "$top"; else (cd "$dir" && pwd -P); fi
+}
+
+# Claude Code keys the default memory folder on the main repository, so all
+# worktrees share it.
+memory_key_root() {
+  local dir="$1" common
+  common=$(cd "$dir" && git rev-parse --git-common-dir 2>/dev/null) || common=""
+  if [ -n "$common" ]; then
+    common=$(cd "$dir" && cd "$common" && pwd -P)
+    case "$common" in
+      */.git) dirname "$common"; return ;;
+    esac
+  fi
+  project_root "$dir"
+}
+
+default_memory_dir() {
+  local key
+  key=$(memory_key_root "$1")
+  printf '%s/projects/%s/memory' "$CLAUDE_DIR" "$(printf '%s' "$key" | tr -c 'A-Za-z0-9' '-')"
+}
+
+sanitize_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'; }
+
+valid_name() {
+  case "$1" in
+    "" | .* ) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Same name on every machine: the origin repo's name, else the folder name.
+default_project_name() {
+  local root="$1" url name
+  url=$(git -C "$root" remote get-url origin 2>/dev/null || true)
+  if [ -n "$url" ]; then
+    name=$(basename "$url")
+    name="${name%.git}"
+  else
+    name=$(basename "$root")
+  fi
+  sanitize_name "$name"
+}
+
+# The synced memory folder this project uses, or nothing if it isn't linked.
+linked_dir() {
+  local val dir
+  val=$(json_get "$1/.claude/settings.local.json" autoMemoryDirectory)
+  [ -n "$val" ] || return 0
+  dir=$(expand_tilde "$val")
+  case "$dir" in
+    "$SYNC_DIR"/projects/*) printf '%s' "$dir" ;;
+  esac
+}
+
+# settings.local.json holds a per-machine path; keep it out of the project's git.
+ensure_ignored() {
+  local root="$1" exclude
+  git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  if git -C "$root" ls-files --error-unmatch .claude/settings.local.json >/dev/null 2>&1; then
+    warn "note: .claude/settings.local.json is tracked by git in this project, so the memory path will be committed."
+    return 0
+  fi
+  git -C "$root" check-ignore -q .claude/settings.local.json && return 0
+  exclude=$(git -C "$root" rev-parse --git-path info/exclude)
+  case "$exclude" in /*) ;; *) exclude="$root/$exclude" ;; esac
+  mkdir -p "$(dirname "$exclude")"
+  printf '\n# claude-memory-sync: per-machine Claude Code settings\n.claude/settings.local.json\n' >> "$exclude"
+}
+
+# A free name for the other version of a file: foo.md -> foo.conflict-<host>.md
+conflict_name() {
+  local dir="$1" rel="$2" host="$3" base ext out n=1
+  case "$rel" in
+    *.md) base="${rel%.md}"; ext=".md" ;;
+    *)    base="$rel"; ext="" ;;
+  esac
+  out="$base.conflict-$host$ext"
+  while [ -e "$dir/$out" ]; do
+    n=$((n + 1))
+    out="$base.conflict-$host-$n$ext"
+  done
+  printf '%s' "$out"
+}
+
+# Append the lines of index $1 that $2 doesn't have yet.
+merge_index() {
+  local src="$1" dst="$2" missing
+  missing=$(grep -Fxv -f "$dst" "$src" || true)
+  [ -n "$missing" ] || return 0
+  [ -z "$(tail -c1 "$dst")" ] || printf '\n' >> "$dst"
+  printf '%s\n' "$missing" >> "$dst"
+}
+
+# Copy memory files from $1 into $2 without overwriting anything.
+migrate_memory() {
+  local src="$1" dst="$2" f name copy
+  [ -d "$src" ] || return 0
+  for f in "$src"/*; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f")
+    if [ ! -e "$dst/$name" ]; then
+      cp -Rp "$f" "$dst/$name"
+      MIGRATED=$((MIGRATED + 1))
+    elif [ -d "$f" ] || cmp -s "$f" "$dst/$name"; then
+      :
+    elif [ "$name" = MEMORY.md ]; then
+      merge_index "$f" "$dst/$name"
+    else
+      copy=$(conflict_name "$dst" "$name" "$(host_name)")
+      cp -p "$f" "$dst/$copy"
+      CONFLICTS=$((CONFLICTS + 1))
+    fi
+  done
+}
+
+# --- sync -------------------------------------------------------------------
+
+lock() {
+  local wait="${1:-0}" waited=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    # A lock older than two minutes belongs to a sync that died.
+    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    [ "$waited" -lt "$wait" ] || return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  trap unlock EXIT
+}
+
+unlock() {
+  rm -rf "$LOCK_DIR"
+  trap - EXIT
+}
+
+current_branch() { g symbolic-ref --quiet --short HEAD 2>/dev/null || echo main; }
+has_remote() { g remote get-url origin >/dev/null 2>&1; }
+
+commit_local() {
+  g add -A || return 1
+  g diff --cached --quiet && return 0
+  g -c commit.gpgsign=false commit --quiet --no-verify -m "memory: sync from $(host_name)" >>"$LOG_FILE" 2>&1
+}
+
+has_unpushed() {
+  local b
+  b=$(current_branch)
+  g rev-parse --verify --quiet HEAD >/dev/null || return 1
+  g rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null || return 0
+  [ -n "$(g rev-list -n1 "refs/remotes/origin/$b..HEAD" 2>/dev/null)" ]
+}
+
+# Resolve an in-progress merge without asking anyone. Stage 2 is this
+# machine's version, stage 3 the remote's.
+resolve_conflicts() {
+  local path stages copy host
+  host=$(host_name)
+  while IFS= read -r -d '' path; do
+    stages=$(g ls-files -u -- "$path" | awk '{print $3}' | sort -u | tr -d '\n')
+    mkdir -p "$SYNC_DIR/$(dirname "$path")"
+    case "$stages" in
+      *2*3*)
+        copy=$(conflict_name "$SYNC_DIR" "$path" "$host")
+        g show ":2:$path" > "$SYNC_DIR/$copy" || return 1
+        g show ":3:$path" > "$SYNC_DIR/$path" || return 1
+        g add -- "$path" "$copy" || return 1
+        log "conflict in $path: kept both versions ($copy is from $host)"
+        ;;
+      *2*)  # deleted remotely, edited here: keep the edit
+        g show ":2:$path" > "$SYNC_DIR/$path" && g add -- "$path" || return 1 ;;
+      *3*)  # deleted here, edited remotely: keep the edit
+        g show ":3:$path" > "$SYNC_DIR/$path" && g add -- "$path" || return 1 ;;
+      *) return 1 ;;
+    esac
+  done < <(g diff --name-only --diff-filter=U -z)
+  g -c commit.gpgsign=false commit --quiet --no-verify --no-edit >>"$LOG_FILE" 2>&1
+}
+
+merge_remote() {
+  local branch="$1"
+  g rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null || return 0
+  if ! g rev-parse --verify --quiet HEAD >/dev/null; then
+    g reset --quiet --hard "origin/$branch" >>"$LOG_FILE" 2>&1
+    return
+  fi
+  g -c commit.gpgsign=false merge --quiet --no-edit --allow-unrelated-histories \
+    "origin/$branch" >>"$LOG_FILE" 2>&1 && return 0
+  if ! resolve_conflicts; then
+    g merge --abort >/dev/null 2>&1 || true
+    log "merge failed; local commits kept, will retry on next sync"
+    return 1
+  fi
+}
+
+# Commit, merge the remote, push. Callers hold the lock.
+# Returns 0 on success, 2 if the remote is unreachable, 1 on other errors.
+sync_now() {
+  local branch attempt remote_head
+  if [ -f "$SYNC_DIR/.git/MERGE_HEAD" ]; then
+    g merge --abort >/dev/null 2>&1 || g reset --quiet --merge >/dev/null 2>&1 || true
+  fi
+  commit_local || { log "commit failed"; return 1; }
+  has_remote || return 0
+  branch=$(current_branch)
+  for attempt in 1 2 3; do
+    if ! gnet fetch --quiet origin >>"$LOG_FILE" 2>&1; then
+      log "fetch failed (offline or no access)"
+      return 2
+    fi
+    merge_remote "$branch" || return 1
+    g rev-parse --verify --quiet HEAD >/dev/null || return 0
+    remote_head=$(g rev-parse --verify --quiet "refs/remotes/origin/$branch" || true)
+    if [ "$(g rev-parse HEAD)" = "$remote_head" ] \
+      || gnet push --quiet origin "HEAD:refs/heads/$branch" >>"$LOG_FILE" 2>&1; then
+      date '+%Y-%m-%d %H:%M:%S' > "$LAST_SYNC_FILE"
+      trim_log
+      return 0
+    fi
+    log "push rejected (attempt $attempt), retrying"
+  done
+  return 1
+}
+
+trim_log() {
+  [ -f "$LOG_FILE" ] || return 0
+  if [ "$(wc -l < "$LOG_FILE")" -gt 1000 ]; then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+# --- hooks ------------------------------------------------------------------
+
+hooks_installed() {
+  [ -f "$USER_SETTINGS" ] || return 1
+  jq -e --arg re "$HOOK_RE" \
+    '[.hooks[]?[]?.hooks[]?.command // empty | select(test($re))] | length >= 3' \
+    "$USER_SETTINGS" >/dev/null 2>&1
+}
+
+backup_settings() {
+  local backup="$USER_SETTINGS.bak-claude-memory-sync"
+  if [ -f "$USER_SETTINGS" ] && [ ! -e "$backup" ]; then
+    cp -p "$USER_SETTINGS" "$backup"
+    say "Backed up $(tildify "$USER_SETTINGS") to $(tildify "$backup")"
+  fi
+}
+
+JQ_WITHOUT_OURS='def without_ours:
+  map(.hooks = ((.hooks // []) | map(select(((.command // "") | test($re)) | not))))
+  | map(select(.hooks | length > 0));'
+
+cmd_install_hooks() {
+  need jq
+  backup_settings
+  json_edit "$USER_SETTINGS" --arg cmd "\"$(self_path)\" hook" --arg re "$HOOK_RE" "$JQ_WITHOUT_OURS"'
+    def put(event; hook): .hooks[event] = (((.hooks[event] // []) | without_ours) + [{hooks: [hook]}]);
+    .hooks = (.hooks // {})
+    | put("SessionStart"; {type: "command", command: ($cmd + " session-start"), timeout: 30})
+    | put("Stop"; {type: "command", command: ($cmd + " stop"), async: true})
+    | put("SessionEnd"; {type: "command", command: ($cmd + " session-end"), timeout: 15})'
+  say "Installed Claude Code hooks in $(tildify "$USER_SETTINGS")"
+}
+
+cmd_uninstall_hooks() {
+  need jq
+  [ -f "$USER_SETTINGS" ] || { say "No Claude Code settings file; nothing to remove."; return 0; }
+  json_edit "$USER_SETTINGS" --arg re "$HOOK_RE" "$JQ_WITHOUT_OURS"'
+    if .hooks then
+      .hooks |= with_entries(.value |= (if type == "array" then without_ours else . end))
+      | .hooks |= with_entries(select(.value != []))
+      | if .hooks == {} then del(.hooks) else . end
+    else . end'
+  say "Removed claude-memory-sync hooks from $(tildify "$USER_SETTINGS")"
+}
+
+# Runs inside Claude Code. Must never fail the session, and never prompt.
+cmd_hook() {
+  local event="${1:-}" input=""
+  set +e
+  is_initialized || exit 0
+  export GIT_TERMINAL_PROMPT=0
+  if [ -z "${GIT_SSH_COMMAND:-}" ] && [ -z "$(git config --get core.sshCommand 2>/dev/null)" ]; then
+    export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10"
+  fi
+  case "$event" in
+    session-start)
+      [ -t 0 ] || input=$(cat)
+      hook_session_start "$input" ;;
+    stop)
+      hook_push 0 ;;
+    session-end)
+      hook_push 5 ;;
+  esac
+  exit 0
+}
+
+hook_push() {
+  [ -n "$(g status --porcelain 2>/dev/null)" ] || has_unpushed || return 0
+  lock "$1" || return 0
+  sync_now
+}
+
+# Claude Code loads MEMORY.md before SessionStart hooks run, so anything
+# pulled here is handed to Claude as hook output instead.
+hook_session_start() {
+  local cwd root dir rel before rc=0 changed="" conflicts name f
+  cwd=$(printf '%s' "$1" | jq -r '.cwd // empty' 2>/dev/null)
+  [ -n "$cwd" ] && [ -d "$cwd" ] || cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+  root=$(project_root "$cwd")
+  dir=$(linked_dir "$root")
+
+  lock 15 || return 0
+  commit_local
+  before=$(g rev-parse --verify --quiet HEAD)
+  sync_now || rc=$?
+
+  if [ -z "$dir" ]; then
+    name=$(default_project_name "$root")
+    if [ -n "$(ls -A "$SYNC_DIR/projects/$name" 2>/dev/null)" ]; then
+      say "[claude-memory-sync] Synced auto memory exists for a project named \"$name\", but this folder isn't linked on this machine, so that memory isn't loaded. If it's the same project, tell the user once that they can run \`claude-memory-sync link\` in $root and then restart Claude Code."
+    fi
+    return 0
+  fi
+
+  case "$rc" in
+    2) say "[claude-memory-sync] Couldn't reach the memory repository (offline or no access). Memories saved on other machines since the last sync may be missing. Details: \`claude-memory-sync status\`." ;;
+    1) say "[claude-memory-sync] Syncing auto memory failed. Ask the user to run \`claude-memory-sync status\`." ;;
+  esac
+
+  rel="${dir#"$SYNC_DIR"/}"
+  if [ -n "$before" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && changed="$changed ${f#"$rel"/}"
+    done < <(g diff --name-only "$before" HEAD -- "$rel" 2>/dev/null)
+  fi
+  if [ -n "$changed" ]; then
+    say "[claude-memory-sync] This project's auto memory was just updated from another machine, so the MEMORY.md loaded at session start is out of date. The current index is below (memory directory: $dir)."
+    say "Changed files:$changed"
+    if [ -f "$dir/MEMORY.md" ]; then
+      say "--- MEMORY.md ---"
+      head -n 200 "$dir/MEMORY.md"
+      say "--- end of MEMORY.md ---"
+    fi
+  fi
+
+  conflicts=$(cd "$dir" && find . -type f -name '*.conflict-*' | sort)
+  if [ -n "$conflicts" ]; then
+    say "[claude-memory-sync] Two machines changed the same memory file, so both versions were kept. Each file below holds the other version of the file with the same name minus the \".conflict-<machine>\" part. When convenient, merge each one into its original and delete the conflict copy:"
+    while IFS= read -r f; do
+      say "- $dir/${f#./}"
+    done <<< "$conflicts"
+  fi
+}
+
+# --- commands ---------------------------------------------------------------
+
+ensure_identity() {
+  [ -n "$(g config user.email 2>/dev/null)" ] || g config user.email "claude-memory-sync@$(host_name)"
+  [ -n "$(g config user.name 2>/dev/null)" ] || g config user.name "claude-memory-sync ($(host_name))"
+}
+
+scaffold() {
+  mkdir -p "$SYNC_DIR/projects"
+  [ -e "$SYNC_DIR/projects/.gitkeep" ] || : > "$SYNC_DIR/projects/.gitkeep"
+  if ! grep -qs '^MEMORY.md merge=union' "$SYNC_DIR/.gitattributes"; then
+    printf '%s\n' \
+      '# Both machines append to the memory index: keep lines from both sides.' \
+      'MEMORY.md merge=union' >> "$SYNC_DIR/.gitattributes"
+  fi
+  [ -e "$SYNC_DIR/.gitignore" ] || printf '.DS_Store\n*.swp\n*~\n' > "$SYNC_DIR/.gitignore"
+  [ -e "$SYNC_DIR/README.md" ] || cat > "$SYNC_DIR/README.md" <<'EOF'
+# Claude Code memory
+
+Managed by [claude-memory-sync](https://github.com/tahabozdemir/claude-memory-sync).
+Each folder under `projects/` is one project's Claude Code auto memory.
+
+**Keep this repository private.** Memories can contain details about your work.
+EOF
+}
+
+# Refuse a public GitHub repo when gh can tell us.
+check_private() {
+  local url="$1" slug vis
+  command -v gh >/dev/null 2>&1 || return 0
+  slug=$(printf '%s' "$url" | sed -nE 's#^(git@github\.com:|https://github\.com/|ssh://git@github\.com/)([^/]+/[^/]+)$#\2#p')
+  slug="${slug%.git}"
+  [ -n "$slug" ] || return 0
+  vis=$(gh repo view "$slug" --json visibility --jq .visibility 2>/dev/null || true)
+  if [ "$vis" = PUBLIC ]; then
+    die "$slug is a PUBLIC repository. Memories can contain private details; make it private (gh repo edit $slug --visibility private --accept-visibility-change-consequences) or pass --allow-public."
+  fi
+}
+
+cmd_init() {
+  local url="" hooks=1 allow_public=0 existing err rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-hooks) hooks=0 ;;
+      --allow-public) allow_public=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) url="$1" ;;
+    esac
+    shift
+  done
+  need git
+  need jq
+
+  if is_initialized; then
+    existing=$(g remote get-url origin 2>/dev/null || true)
+    if [ -n "$url" ] && [ "$url" != "$existing" ]; then
+      die "$(tildify "$SYNC_DIR") is already set up with remote '$existing'."
+    fi
+    say "Using the existing sync repo at $(tildify "$SYNC_DIR")"
+  else
+    [ -n "$url" ] || die "usage: claude-memory-sync init <git-url>  (a PRIVATE repo, e.g. git@github.com:you/claude-memory.git)"
+    [ "$allow_public" = 1 ] || check_private "$url"
+    if [ -e "$SYNC_DIR" ] && [ -n "$(ls -A "$SYNC_DIR" 2>/dev/null)" ]; then
+      die "$SYNC_DIR already exists and isn't empty. Move it away or set CLAUDE_MEMORY_SYNC_DIR."
+    fi
+    say "Cloning $url into $(tildify "$SYNC_DIR")"
+    if ! err=$(git clone --quiet "$url" "$SYNC_DIR" 2>&1); then
+      printf '%s\n' "$err" >&2
+      die "could not clone $url. Check the URL and that you can access it (try: git ls-remote $url)."
+    fi
+  fi
+
+  ensure_identity
+  scaffold
+  lock 30 || die "another sync is running; try again in a moment."
+  sync_now || rc=$?
+  case "$rc" in
+    0) say "Sync repo is up to date." ;;
+    2) warn "couldn't reach the remote; local changes are committed and will be pushed on the next sync." ;;
+    *) warn "sync failed; see $(tildify "$LOG_FILE")" ;;
+  esac
+  unlock
+
+  [ "$hooks" = 0 ] || cmd_install_hooks
+
+  say ""
+  say "Next: in each project folder, run"
+  say "    claude-memory-sync link"
+  say "On your other machines, install claude-memory-sync and run"
+  say "    claude-memory-sync init ${url:-$(g remote get-url origin 2>/dev/null || echo '<same-url>')}"
+}
+
+cmd_link() {
+  local name="" root settings current target default existed=0 others rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  need jq
+  require_init
+
+  root=$(project_root "$PWD")
+  [ "$root" != "$(cd "$HOME" && pwd -P)" ] || die "run this inside a project folder, not your home folder."
+  [ -n "$name" ] || name=$(default_project_name "$root")
+  name=$(sanitize_name "$name")
+  valid_name "$name" || die "invalid project name '$name'."
+  target="$SYNC_DIR/projects/$name"
+  settings="$root/.claude/settings.local.json"
+  current=$(json_get "$settings" autoMemoryDirectory)
+
+  if [ -n "$current" ] && [ "$(expand_tilde "$current")" = "$target" ]; then
+    say "Already linked: $(tildify "$root") -> $(tildify "$target")"
+    return 0
+  fi
+
+  lock 30 || die "another sync is running; try again in a moment."
+  sync_now || warn "couldn't sync with the remote first; linking with what's on this machine."
+  [ -z "$(ls -A "$target" 2>/dev/null)" ] || existed=1
+  mkdir -p "$target"
+
+  default=$(default_memory_dir "$root")
+  migrate_memory "$default" "$target"
+  [ -z "$current" ] || migrate_memory "$(expand_tilde "$current")" "$target"
+
+  json_edit "$settings" --arg v "$(tildify "$target")" '.autoMemoryDirectory = $v'
+  ensure_ignored "$root"
+  sync_now || rc=$?
+  unlock
+
+  say "Linked '$name': $(tildify "$root") -> $(tildify "$target")"
+  [ "$existed" = 0 ] || say "  - Memories from your other machines are already there."
+  [ "$MIGRATED" = 0 ] || say "  - Added $MIGRATED memory file(s) from this machine."
+  if [ "$CONFLICTS" -gt 0 ]; then
+    say "  - $CONFLICTS file(s) differed from the synced version; this machine's copy was kept as *.conflict-$(host_name).md."
+    say "    Claude is asked to merge them at the start of the next session."
+  fi
+  [ ! -d "$default" ] || say "  - The original folder was left untouched as a backup: $(tildify "$default")"
+  if [ "$existed" = 0 ]; then
+    others=$(cd "$SYNC_DIR/projects" && ls -A | grep -vx -e "$name" -e .gitkeep | tr '\n' ' ' || true)
+    if [ -n "$others" ]; then
+      say "  - This is a new synced project. Other synced projects: $others"
+      say "    If this folder is one of those, run: claude-memory-sync link <name>"
+    fi
+  fi
+  [ "$rc" = 0 ] || warn "couldn't push yet; it will sync automatically later."
+  say "Restart any Claude Code session running in this project to use the synced memory."
+}
+
+cmd_unlink() {
+  local root settings current dir default
+  need jq
+  require_init
+  root=$(project_root "$PWD")
+  settings="$root/.claude/settings.local.json"
+  current=$(json_get "$settings" autoMemoryDirectory)
+  [ -n "$current" ] || { say "This project isn't linked."; return 0; }
+
+  dir=$(expand_tilde "$current")
+  default=$(default_memory_dir "$root")
+  mkdir -p "$default"
+  migrate_memory "$dir" "$default"
+  json_edit "$settings" 'del(.autoMemoryDirectory)'
+
+  say "Unlinked $(tildify "$root")."
+  say "  - Memory copied back to $(tildify "$default"), so Claude keeps it on this machine."
+  say "  - The synced copy stays in $(tildify "$dir") for your other machines."
+  say "Restart any Claude Code session running in this project."
+}
+
+cmd_sync() {
+  local rc=0
+  require_init
+  lock 30 || die "another sync is running; try again in a moment."
+  sync_now || rc=$?
+  case "$rc" in
+    0) say "Synced." ;;
+    2) die "couldn't reach the remote (offline or no access). Local changes are committed and will be pushed later." ;;
+    *) die "sync failed. Recent log:
+$(tail -n 10 "$LOG_FILE" 2>/dev/null)" ;;
+  esac
+}
+
+cmd_status() {
+  local root dir branch dirty unpushed conflicts p count list=""
+  say "claude-memory-sync $VERSION"
+  if ! is_initialized; then
+    say "  Not set up on this machine. Run: claude-memory-sync init <git-url>"
+    return 0
+  fi
+  branch=$(current_branch)
+  say "  Sync repo:   $(tildify "$SYNC_DIR")"
+  say "  Remote:      $(g remote get-url origin 2>/dev/null || echo 'none') ($branch)"
+  say "  Last sync:   $(cat "$LAST_SYNC_FILE" 2>/dev/null || echo never)"
+  if hooks_installed; then
+    say "  Hooks:       installed in $(tildify "$USER_SETTINGS")"
+  else
+    say "  Hooks:       NOT installed (run: claude-memory-sync install-hooks)"
+  fi
+
+  dirty=$(g status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  unpushed=0
+  if g rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+    unpushed=$(g rev-list --count "refs/remotes/origin/$branch..HEAD" 2>/dev/null || echo 0)
+  elif g rev-parse --verify --quiet HEAD >/dev/null; then
+    unpushed=$(g rev-list --count HEAD)
+  fi
+  if [ "$dirty" = 0 ] && [ "$unpushed" = 0 ]; then
+    say "  Pending:     nothing, everything is pushed"
+  else
+    say "  Pending:     $dirty uncommitted change(s), $unpushed unpushed commit(s)"
+  fi
+
+  root=$(project_root "$PWD")
+  dir=$(linked_dir "$root")
+  if [ -n "$dir" ]; then
+    say "  This folder: linked as '$(basename "$dir")'"
+  else
+    say "  This folder: not linked"
+  fi
+
+  for p in "$SYNC_DIR"/projects/*/; do
+    [ -d "$p" ] || continue
+    count=$(find "$p" -type f -name '*.md' ! -name MEMORY.md | wc -l | tr -d ' ')
+    list="${list:+$list, }$(basename "$p") ($count)"
+  done
+  say "  Projects:    ${list:-none yet}"
+
+  conflicts=$(cd "$SYNC_DIR" && find projects -type f -name '*.conflict-*' 2>/dev/null)
+  if [ -n "$conflicts" ]; then
+    say "  Conflict copies waiting to be merged:"
+    printf '%s\n' "$conflicts" | sed 's/^/    /'
+  fi
+  if [ -s "$LOG_FILE" ]; then
+    say "  Last log line: $(tail -n 1 "$LOG_FILE")"
+  fi
+}
+
+usage() {
+  cat <<EOF
+claude-memory-sync $VERSION: sync Claude Code auto memory across machines
+
+Usage:
+  claude-memory-sync init <git-url>   Set up this machine: clone the private repo, install hooks
+  claude-memory-sync link [name]      Sync the current project's memory (run in the project folder)
+  claude-memory-sync unlink           Stop syncing the current project on this machine
+  claude-memory-sync sync             Sync now (the hooks do this automatically)
+  claude-memory-sync status           Show what's synced and whether anything is pending
+  claude-memory-sync install-hooks    (Re)install the Claude Code hooks
+  claude-memory-sync uninstall-hooks  Remove the hooks from Claude Code settings
+  claude-memory-sync version
+
+init options:
+  --no-hooks       don't touch Claude Code settings
+  --allow-public   allow a public GitHub repository (not recommended)
+
+Environment:
+  CLAUDE_MEMORY_SYNC_DIR   location of the sync repo (default: ~/.claude-memory)
+  CLAUDE_CONFIG_DIR        Claude Code config folder (default: ~/.claude)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    init)            cmd_init "$@" ;;
+    link)            cmd_link "$@" ;;
+    unlink)          cmd_unlink "$@" ;;
+    sync)            cmd_sync "$@" ;;
+    status)          cmd_status "$@" ;;
+    install-hooks)   require_init; cmd_install_hooks ;;
+    uninstall-hooks) cmd_uninstall_hooks ;;
+    hook)            cmd_hook "$@" ;;
+    version|--version|-v) say "claude-memory-sync $VERSION" ;;
+    help|--help|-h)  usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
