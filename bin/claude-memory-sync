@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 SYNC_DIR="${CLAUDE_MEMORY_SYNC_DIR:-$HOME/.claude-memory}"
 SYNC_DIR="${SYNC_DIR%/}"
@@ -25,6 +25,8 @@ USER_SETTINGS="$CLAUDE_DIR/settings.json"
 LOCK_DIR="$SYNC_DIR/.git/claude-memory-sync.lock"
 LOG_FILE="$SYNC_DIR/.git/claude-memory-sync.log"
 LAST_SYNC_FILE="$SYNC_DIR/.git/claude-memory-sync.last"
+# Projects linked on this machine: "<name>\t<project root>" per line. Not synced.
+LINKS_FILE="$SYNC_DIR/.git/claude-memory-sync.links"
 
 # Matches the hook commands this tool installs, quoted path or not.
 HOOK_RE='claude-memory-sync"? hook (session-start|stop|session-end)'
@@ -169,6 +171,29 @@ linked_dir() {
   case "$dir" in
     "$SYNC_DIR"/projects/*) printf '%s' "$dir" ;;
   esac
+}
+
+remember_link() {
+  forget_link "$2"
+  printf '%s\t%s\n' "$1" "$2" >> "$LINKS_FILE"
+}
+
+forget_link() {
+  [ -f "$LINKS_FILE" ] || return 0
+  awk -F '\t' -v root="$1" '$2 != root' "$LINKS_FILE" > "$LINKS_FILE.tmp" && mv "$LINKS_FILE.tmp" "$LINKS_FILE"
+}
+
+# Synced projects with memory that no folder on this machine is linked to.
+unlinked_projects() {
+  local p n list=""
+  for p in "$SYNC_DIR"/projects/*/; do
+    [ -d "$p" ] || continue
+    n=$(basename "$p")
+    [ "$n" != "${1:-}" ] && [ -n "$(ls -A "$p")" ] || continue
+    if [ -f "$LINKS_FILE" ] && cut -f1 "$LINKS_FILE" | grep -Fxq -- "$n"; then continue; fi
+    list="${list:+$list, }$n"
+  done
+  printf '%s' "$list"
 }
 
 # settings.local.json holds a per-machine path; keep it out of the project's git.
@@ -589,6 +614,7 @@ cmd_link() {
   current=$(json_get "$settings" autoMemoryDirectory)
 
   if [ -n "$current" ] && [ "$(expand_tilde "$current")" = "$target" ]; then
+    remember_link "$name" "$root"
     say "Already linked: $(tildify "$root") -> $(tildify "$target")"
     return 0
   fi
@@ -604,6 +630,7 @@ cmd_link() {
 
   json_edit "$settings" --arg v "$(tildify "$target")" '.autoMemoryDirectory = $v'
   ensure_ignored "$root"
+  remember_link "$name" "$root"
   sync_now || rc=$?
   unlock
 
@@ -616,9 +643,9 @@ cmd_link() {
   fi
   [ ! -d "$default" ] || say "  - The original folder was left untouched as a backup: $(tildify "$default")"
   if [ "$existed" = 0 ]; then
-    others=$(cd "$SYNC_DIR/projects" && ls -A | grep -vx -e "$name" -e .gitkeep | tr '\n' ' ' || true)
+    others=$(unlinked_projects "$name")
     if [ -n "$others" ]; then
-      say "  - This is a new synced project. Other synced projects: $others"
+      say "  - This is a new synced project. Synced projects not linked on this machine yet: $others"
       say "    If this folder is one of those, run: claude-memory-sync link <name>"
     fi
   fi
@@ -640,6 +667,7 @@ cmd_unlink() {
   mkdir -p "$default"
   migrate_memory "$dir" "$default"
   json_edit "$settings" 'del(.autoMemoryDirectory)'
+  forget_link "$root"
 
   say "Unlinked $(tildify "$root")."
   say "  - Memory copied back to $(tildify "$default"), so Claude keeps it on this machine."
@@ -661,7 +689,7 @@ $(tail -n 10 "$LOG_FILE" 2>/dev/null)" ;;
 }
 
 cmd_status() {
-  local root dir branch dirty unpushed conflicts p count list=""
+  local root dir branch dirty unpushed conflicts p count list="" others
   say "claude-memory-sync $VERSION"
   if ! is_initialized; then
     say "  Not set up on this machine. Run: claude-memory-sync init <git-url>"
@@ -696,6 +724,10 @@ cmd_status() {
     say "  This folder: linked as '$(basename "$dir")'"
   else
     say "  This folder: not linked"
+  fi
+  others=$(unlinked_projects)
+  if [ -n "$others" ]; then
+    say "  Not linked on this machine: $others"
   fi
 
   for p in "$SYNC_DIR"/projects/*/; do

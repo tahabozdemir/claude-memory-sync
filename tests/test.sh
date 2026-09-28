@@ -127,6 +127,22 @@ check "context carries the new index" contains "$OUT" "- [Gamma](gamma.md) — g
 check "context lists the conflict copy" contains "$OUT" "beta.conflict-hostB.md"
 check "quiet when nothing changed" eq "$(hook A session-start "$PA" | grep -c 'updated from another machine' || true)" 0
 
+echo "5b. link hints only name projects not linked on this machine"
+PA2="$T/A/work/other"
+new_project A "$PA2"
+git -C "$PA2" remote set-url origin https://github.com/acme/other.git
+mkdir -p "$T/A/.claude/projects/$(slug "$PA2")/memory"
+echo "other fact" > "$T/A/.claude/projects/$(slug "$PA2")/memory/o.md"
+check "no hint when every synced project is linked here" eval '! cms A "$PA2" link | grep -q "not linked on this machine"'
+PB3="$T/B/code/renamed"
+new_project B "$PB3"
+git -C "$PB3" remote set-url origin https://github.com/acme/renamed.git
+OUT=$(cms B "$PB3" link)
+check "hint lists projects not linked here" contains "$OUT" "not linked on this machine yet: other"
+check "hint skips projects linked here" eval 'printf "%s\n" "$OUT" | grep -q "not linked on this machine yet: other$"'
+cms B "$PB3" unlink >/dev/null
+check "status lists unlinked projects" contains "$(cms B "$PB3" status)" "Not linked on this machine: other"
+
 echo "6. both machines add memories at the same time"
 printf -- '- [Delta](delta.md) — from A\n' >> "$DA/MEMORY.md"
 echo "delta fact" > "$DA/delta.md"
