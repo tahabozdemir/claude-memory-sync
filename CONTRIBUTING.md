@@ -11,7 +11,7 @@ bash tests/test.sh
 shellcheck bin/claude-memory-sync install.sh tests/test.sh
 ```
 
-CI runs both on Linux and on macOS with the stock `/bin/bash` 3.2.
+CI runs both on Linux and on macOS with the stock `/bin/bash` 3.2. It uses ShellCheck 0.11.0; older versions (like the one `apt` installs) can flag different things. To run exactly what CI runs: `pipx run --spec shellcheck-py==0.11.0.1 shellcheck bin/claude-memory-sync install.sh tests/test.sh`.
 
 ## Guidelines
 

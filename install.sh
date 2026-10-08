@@ -20,7 +20,7 @@ die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
 command -v git >/dev/null 2>&1 || die "git is required."
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd -P || true)
+here=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd -P) || here=""
 tmp=$(mktemp "${TMPDIR:-/tmp}/claude-memory-sync.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
 
