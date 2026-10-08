@@ -1,5 +1,8 @@
 # claude-memory-sync
 
+[![CI](https://img.shields.io/github/actions/workflow/status/tahabozdemir/claude-memory-sync/test.yml?branch=main&label=CI&logo=github)](https://github.com/tahabozdemir/claude-memory-sync/actions/workflows/test.yml)
+[![Lisans: MIT](https://img.shields.io/github/license/tahabozdemir/claude-memory-sync)](LICENSE)
+
 ![claude-memory-sync, laptop ve masaüstündeki ~/.claude-memory klasörünü SessionStart, Stop ve SessionEnd hook'larıyla private bir git reposu üzerinden senkronize tutar](docs/how-it-works.webp)
 
 Claude Code'un **auto memory**'sini (otomatik hafızasını) tüm bilgisayarlarında senkronize tutar. Bunu kendine ait private bir git reposu üzerinden yapar.

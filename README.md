@@ -1,5 +1,8 @@
 # claude-memory-sync
 
+[![CI](https://img.shields.io/github/actions/workflow/status/tahabozdemir/claude-memory-sync/test.yml?branch=main&label=CI&logo=github)](https://github.com/tahabozdemir/claude-memory-sync/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/github/license/tahabozdemir/claude-memory-sync)](LICENSE)
+
 ![claude-memory-sync keeps ~/.claude-memory on your laptop and desktop in sync through a private git repo, using the SessionStart, Stop and SessionEnd hooks](docs/how-it-works.webp)
 
 Keep Claude Code's **auto memory** in sync across all your machines, through a private git repository you own.
