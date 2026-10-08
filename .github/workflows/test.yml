@@ -21,10 +21,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Pinned: the runner's apt ShellCheck lags behind and flags different things.
       - name: ShellCheck
         run: |
-          shellcheck --version
-          shellcheck bin/claude-memory-sync install.sh tests/test.sh
+          pipx run --spec shellcheck-py==0.11.0.1 shellcheck --version
+          pipx run --spec shellcheck-py==0.11.0.1 shellcheck bin/claude-memory-sync install.sh tests/test.sh
       - name: CHANGELOG covers the script's version
         run: |
           v=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' bin/claude-memory-sync)

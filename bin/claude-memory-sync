@@ -192,7 +192,7 @@ unlinked_projects() {
   for p in "$SYNC_DIR"/projects/*/; do
     [ -d "$p" ] || continue
     n=$(basename "$p")
-    [ "$n" != "${1:-}" ] && [ -n "$(ls -A "$p")" ] || continue
+    if [ "$n" = "${1:-}" ] || [ -z "$(ls -A "$p")" ]; then continue; fi
     if [ -f "$LINKS_FILE" ] && cut -f1 "$LINKS_FILE" | grep -Fxq -- "$n"; then continue; fi
     list="${list:+$list, }$n"
   done
