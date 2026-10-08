@@ -1,5 +1,7 @@
 # claude-memory-sync
 
+![claude-memory-sync keeps ~/.claude-memory on your laptop and desktop in sync through a private git repo, using the SessionStart, Stop and SessionEnd hooks](docs/how-it-works.webp)
+
 Keep Claude Code's **auto memory** in sync across all your machines, through a private git repository you own.
 
 **[Türkçe rehber →](README.tr.md)**
