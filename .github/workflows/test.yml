@@ -2,15 +2,49 @@ name: test
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck bin/claude-memory-sync install.sh tests/test.sh
+      - name: CHANGELOG covers the script's version
+        run: |
+          v=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' bin/claude-memory-sync)
+          grep -q "^## \[$v\]" CHANGELOG.md \
+            || { echo "::error file=CHANGELOG.md::No entry for $v, the VERSION in bin/claude-memory-sync"; exit 1; }
+
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The runner image puts a newer Homebrew bash first; test the 3.2 that macOS ships.
+      - name: Use the stock macOS bash
+        if: runner.os == 'macOS'
+        run: echo /bin >> "$GITHUB_PATH"
+      - run: bash --version | head -n1
       - run: bash tests/test.sh

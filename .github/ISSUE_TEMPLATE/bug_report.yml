@@ -1,0 +1,51 @@
+name: Bug report
+description: Something doesn't sync, a command fails, or a hook misbehaves.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't paste memory contents.** Memories can hold private details; describe file names and what changed instead. Redact private repo URLs, project names and paths if you need to.
+        For security issues, use [private vulnerability reporting](https://github.com/tahabozdemir/claude-memory-sync/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. On machine A: claude-memory-sync link
+        2. On machine B: ...
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `claude-memory-sync status`
+      description: Run it in the affected project folder.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Recent log lines
+      description: "`tail -n 30 ~/.claude-memory/.git/claude-memory-sync.log`"
+      render: text
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 26.1, Ubuntu 24.04, WSL2 ...
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Claude Code, git and jq versions
+      description: "`claude --version; git --version; jq --version`"
+    validations:
+      required: true

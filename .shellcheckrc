@@ -1,0 +1,2 @@
+# jq programs and eval'd test expressions are single-quoted on purpose.
+disable=SC2016

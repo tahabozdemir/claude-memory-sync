@@ -96,7 +96,7 @@ claude-memory-sync status
 ```
 
 ```
-claude-memory-sync 0.1.0
+claude-memory-sync 0.1.1
   Sync repo:   ~/.claude-memory
   Remote:      git@github.com:you/claude-memory.git (main)
   Last sync:   2026-09-28 14:02:11
@@ -181,9 +181,12 @@ rm -rf ~/.claude-memory                          # optional: the local copy of t
 
 ```bash
 bash tests/test.sh
+shellcheck bin/claude-memory-sync install.sh tests/test.sh
 ```
 
 The tests simulate two machines (separate `HOME`s) sharing one bare remote. They cover linking, merging, conflicts, delete versus edit, offline mode, and hook installation.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and [SECURITY.md](SECURITY.md) to report a vulnerability. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
