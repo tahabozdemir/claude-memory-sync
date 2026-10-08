@@ -96,7 +96,7 @@ claude-memory-sync status
 ```
 
 ```
-claude-memory-sync 0.1.0
+claude-memory-sync 0.1.1
   Sync repo:   ~/.claude-memory
   Remote:      git@github.com:sen/claude-memory.git (main)
   Last sync:   2026-09-28 14:02:11
@@ -181,9 +181,12 @@ rm -rf ~/.claude-memory                             # isteğe bağlı: reponun y
 
 ```bash
 bash tests/test.sh
+shellcheck bin/claude-memory-sync install.sh tests/test.sh
 ```
 
 Testler, aynı bare remote'u paylaşan iki bilgisayarı (ayrı `HOME` klasörleriyle) simüle eder. Kapsadıkları: link, birleştirme, çakışmalar, silme–düzenleme çakışması, internetsiz çalışma ve hook kurulumu.
+
+Pull request açmadan önce [CONTRIBUTING.md](CONTRIBUTING.md) dosyasına göz at. Güvenlik açıklarını [SECURITY.md](SECURITY.md) üzerinden bildirebilirsin. Değişiklikler [CHANGELOG.md](CHANGELOG.md) dosyasında listelenir.
 
 ## Lisans
 

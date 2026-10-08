@@ -1,0 +1,2 @@
+# Shell scripts break with CRLF line endings (e.g. a Windows checkout used from WSL).
+* text=auto eol=lf
